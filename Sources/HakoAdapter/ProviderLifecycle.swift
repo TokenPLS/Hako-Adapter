@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Network
+import NetworkExtension
 
 enum ProviderLifecycleState: String, Equatable {
     case idle
@@ -34,6 +35,60 @@ enum ProviderTeardownPolicy {
     var clearsNetworkSettings: Bool {
         self == .failedStart
     }
+}
+
+/// A named meaning for an `NEProviderStopReason`, with the raw code kept
+/// alongside for a bug report. The exported log used to read `reason=5`, which
+/// tells a reader nothing they can act on and makes "I stopped it myself" look
+/// like a crash; this leads with the meaning.
+///
+/// Takes the enum, not an Int, so a name can only ever be attached to a case
+/// Apple actually declares. That much the compiler does enforce, and it is the
+/// half that matters most: an earlier hand-written Int table named raw 2
+/// "plugin-failed", which is Apple's word for a different enum entirely
+/// (`NEVPNConnectionErrorPluginFailed`), and no amount of proofreading caught it.
+///
+/// What the compiler does NOT do is fail the build when Apple adds a case.
+/// `@unknown default` downgrades the missing-case diagnostic to `warning: switch
+/// must be exhaustive` and the build still exits 0 (measured; no
+/// warnings-as-errors is set for these targets). So bumping the SDK means
+/// re-reading NEProvider.h by hand -- that is the actual backstop, and the
+/// reason raw 17 went unnamed until a review found it.
+///
+/// Every name is Apple's own case name, kebab-cased, so a reader holding an
+/// exported log can search Apple's documentation for the word and find the case
+/// that stopped their tunnel. Where Apple's spelling is surprising the spelling
+/// still wins: `superceded` and `canceled` are what the SDK and the documentation
+/// say, and a "corrected" spelling would return zero hits.
+///
+/// `.internalError` is newer (iOS 18.1) than this file's deployment floor and is
+/// only legal here because Swift does not apply availability checking to enum
+/// patterns; the same case in expression position is a hard error at iOS 15.0,
+/// which is why the test has to reach it through `#available`.
+func hakoStopReasonSummary(_ reason: NEProviderStopReason) -> String {
+    let meaning: String
+    switch reason {
+    case .none: meaning = "none"
+    case .userInitiated: meaning = "user-initiated"
+    case .providerFailed: meaning = "provider-failed"
+    case .noNetworkAvailable: meaning = "no-network-available"
+    case .unrecoverableNetworkChange: meaning = "unrecoverable-network-change"
+    case .providerDisabled: meaning = "provider-disabled"
+    case .authenticationCanceled: meaning = "authentication-canceled"
+    case .configurationFailed: meaning = "configuration-failed"
+    case .idleTimeout: meaning = "idle-timeout"
+    case .configurationDisabled: meaning = "configuration-disabled"
+    case .configurationRemoved: meaning = "configuration-removed"
+    case .superceded: meaning = "superceded"
+    case .userLogout: meaning = "user-logout"
+    case .userSwitch: meaning = "user-switch"
+    case .connectionFailed: meaning = "connection-failed"
+    case .sleep: meaning = "sleep"
+    case .appUpdate: meaning = "app-update"
+    case .internalError: meaning = "internal-error"
+    @unknown default: meaning = "unrecognized"
+    }
+    return "\(meaning) (reason=\(reason.rawValue))"
 }
 
 /// Small lock-backed state machine because NetworkExtension may deliver a
@@ -114,6 +169,8 @@ actor ProviderOperationGate {
         waiters.removeFirst().resume()
     }
 }
+
+
 
 struct PhysicalPathSnapshot: Equatable, Sendable {
     let interfaceName: String
