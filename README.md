@@ -1,83 +1,50 @@
-<h1 align="center">Hako Adapter</h1>
+# Hako Adapter
 
-<p align="center">Apple Network Extension building blocks for the <a href="https://github.com/TokenPLS/Hako"><strong>Hako</strong> kernel</a>.</p>
+English · [简体中文](README.zh-CN.md)
 
----
-
-`HakoAdapter` is a small, dependency-free Swift library extracted from a
-production Packet Tunnel provider. It contains the two pieces of an Apple
-NE data plane that are genuinely hard to get right, with no product or UI
-code attached:
-
-| Component | What it does |
-|---|---|
-| **`PacketFlowBridge`** | Bridges `NEPacketTunnelFlow` to a kernel-owned tun file descriptor. Apple packets are framed with the Darwin utun-style 4-byte address-family prefix and passed over a bounded `AF_UNIX`/`SOCK_DGRAM` socketpair — the kernel consumes a duplicate of the core-facing descriptor, and neither endpoint is Apple's private utun fd. Bounded queues with drop accounting, batched drains, dispatch-source lifecycle, and a single-failure model. `snapshot()` exposes counters (packets/drops/pending/latency) for diagnostics. |
-| **`ProviderLifecycle`** | A strict provider state machine (`idle → starting → running → stopping`, plus `failed`) that serializes start/stop/sleep/wake transitions, rejects invalid overlaps, and defines teardown policy so a half-started tunnel can never leak network settings. |
-
-Both files import only system frameworks (`Foundation`, `Network`,
-`NetworkExtension`, `Darwin`, `os`). There is no dependency on the Hako
-kernel — the bridge speaks plain file descriptors — so the library also
-works with any core that can read/write a utun-framed descriptor.
-
-## 官网与客户端
-
-- [官方网站](https://clash.md/)
-- [在 App Store 下载官方客户端](https://apps.apple.com/app/id6794257189)
+Swift components for connecting an Apple Packet Tunnel provider to a proxy kernel. This repository contains the packet-flow bridge and provider lifecycle code used by the Hako client.
 
 ## Official website and client
 
 - [Official website](https://clash.md/)
-- [Download the official client on the App Store](https://apps.apple.com/app/id6794257189)
+- [Download Clash on the App Store](https://apps.apple.com/app/id6794257189)
+
+For the complete application, see [Hako-Client](https://github.com/TokenPLS/Hako-Client). The proxy kernel and SDK build tools are in [Hako](https://github.com/TokenPLS/Hako).
+
+## Components
+
+| Source | Responsibility |
+| --- | --- |
+| [`PacketFlowBridge.swift`](Sources/HakoAdapter/PacketFlowBridge.swift) | Transfers packets between `NEPacketTunnelFlow` and a file descriptor, with framing, bounded queues and flow statistics |
+| [`ProviderLifecycle.swift`](Sources/HakoAdapter/ProviderLifecycle.swift) | Coordinates provider state, session ownership, reloads, teardown and physical network path monitoring |
+
+These components use Apple system frameworks. They do not include a proxy engine, an application interface or a complete `NEPacketTunnelProvider` implementation.
 
 ## Requirements
 
-- iOS 15+ / macOS 13+ / tvOS 17+, Swift 5.9+
-- A Packet Tunnel Provider target (`com.apple.networkextension.packet-tunnel`)
-- For a full tunnel: the Hako kernel (`Hako.xcframework`, built with
-  `make lib_apple` from [TokenPLS/Hako](https://github.com/TokenPLS/Hako))
+- macOS with Xcode and the SDK for your target platform.
+- Swift 5.9 or later.
+- Deployment targets: iOS 15+, macOS 13+ or tvOS 17+.
+- A Packet Tunnel extension with its required capabilities and signing configured by your application.
 
-## Install
+## Integrate the sources
 
-Swift Package Manager (this repository is a package), or copy the two files
-from `Sources/HakoAdapter/` into your extension target — they are
-self-contained by design.
+The current types have Swift `internal` access. Compile the source files in your consuming target; importing the package from another module does not expose these types as a public API.
 
-## Wiring sketch
+1. Check out a specific revision of this repository.
+2. Add the files under `Sources/HakoAdapter` to your Packet Tunnel extension target, keeping the accompanying license.
+3. Supply your kernel connection and coordinate startup, network settings, packet handling and shutdown in your provider.
 
-Inside your `NEPacketTunnelProvider`, after applying
-`NEPacketTunnelNetworkSettings`:
+The [Hako-Client bootstrap script](https://github.com/TokenPLS/Hako-Client/blob/main/scripts/bootstrap.py) demonstrates fetching a pinned revision and placing the sources in the consuming project.
 
-```swift
-let bridge = PacketFlowBridge(packetFlow: packetFlow) { error in
-    // Single-failure model: tear the tunnel down on any bridge error.
-}
-let coreFD = try bridge.start() // core-facing end of the socketpair
+`PacketFlowBridge.start()` returns the core-facing descriptor of a socket pair. The descriptor carries packets with a four-byte address-family prefix; it is not Apple's private utun descriptor. Keep the bridge alive for the tunnel session and call `stop()` during teardown. See the source for descriptor ownership and error handling.
 
-// Hand `coreFD` to the kernel. With Hako, return it from the platform
-// callback that the kernel invokes to open the tun (the kernel dup()s it,
-// so your side keeps ownership of the original).
+## Status and feedback
 
-// On teardown:
-bridge.stop()
-```
+This is pre-release integration code. Pin a revision and validate the lifecycle and packet flow in your own application. The repository's package declaration describes its build structure; it does not promise a stable external Swift API.
 
-Use `ProviderLifecycle` to gate `startTunnel` / `stopTunnel` / `sleep` /
-`wake` so overlapping system callbacks cannot race your provider state:
-
-```swift
-let lifecycle = ProviderLifecycle()
-try lifecycle.beginStart()
-// … apply settings, start the kernel, start the bridge …
-try lifecycle.didStart()
-```
-
-## Status
-
-Pre-release. Extracted from an actively developed codebase; the API may
-still change with its production consumer. Issues and PRs are welcome —
-kernel-side behavior belongs in
-[TokenPLS/Hako](https://github.com/TokenPLS/Hako).
+Report component problems in [Issues](https://github.com/TokenPLS/Hako-Adapter/issues), including the revision, target platform and a minimal reproduction. App issues belong in [Hako-Client](https://github.com/TokenPLS/Hako-Client/issues); kernel issues belong in [Hako](https://github.com/TokenPLS/Hako/issues). Remove credentials and subscription links from public reports. Follow [SECURITY.md](SECURITY.md) for security reports.
 
 ## License
 
-GPL-3.0 (see `LICENSE`). © 2026 The Hako Authors.
+[GPL-3.0](LICENSE). See the source and license file for attribution.
