@@ -21,7 +21,7 @@ works with any core that can read/write a utun-framed descriptor.
 
 ## Requirements
 
-- iOS 15+ / macOS 13+, Swift 5.9+
+- iOS 15+ / macOS 13+ / tvOS 17+, Swift 5.9+
 - A Packet Tunnel Provider target (`com.apple.networkextension.packet-tunnel`)
 - For a full tunnel: the Hako kernel (`Hako.xcframework`, built with
   `make lib_apple` from [TokenPLS/Hako](https://github.com/TokenPLS/Hako))

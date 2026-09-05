@@ -6,6 +6,7 @@ let package = Package(
     platforms: [
         .iOS(.v15),
         .macOS(.v13),
+        .tvOS(.v17),
     ],
     products: [
         .library(name: "HakoAdapter", targets: ["HakoAdapter"]),
