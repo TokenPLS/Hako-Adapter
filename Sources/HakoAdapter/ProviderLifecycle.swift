@@ -170,6 +170,75 @@ actor ProviderOperationGate {
     }
 }
 
+/// A lease for one tunnel-start attempt. Late work may publish state only
+/// while its session remains current; abandoned work can compensate once
+/// while no successor owns the tunnel settings.
+final class ProviderTunnelSessionLease: @unchecked Sendable {
+    /// A single attempt's identity. Opaque on purpose: holders may only hand it
+    /// back, never reason about ordering.
+    struct Session: Equatable {
+        fileprivate let generation: UInt64
+    }
+
+    private let lock = NSLock()
+    private var issued: UInt64 = 0
+    private var current: UInt64?
+    /// Set when a live session was dropped: Apple cannot cancel
+    /// `setTunnelNetworkSettings`, so the abandoned attempt may still owe the
+    /// system a cleanup even though nothing of it was ever published.
+    private var owesCompensation = false
+
+    /// Opens a session and makes it the current one, superseding any predecessor.
+    func begin() -> Session {
+        lock.lock()
+        defer { lock.unlock() }
+        issued &+= 1
+        current = issued
+        return Session(generation: issued)
+    }
+
+    /// Drops the current session. A timeout or a teardown calls this; every
+    /// later `commitIfCurrent` for that session is refused.
+    func invalidate() {
+        lock.lock()
+        if current != nil { owesCompensation = true }
+        current = nil
+        lock.unlock()
+    }
+
+    /// Runs `commit` only if `session` is still the current one, under the lock
+    /// that `invalidate` takes -- so the two cannot interleave.
+    ///
+    /// - Returns: whether `commit` ran.
+    @discardableResult
+    func commitIfCurrent(_ session: Session, _ commit: () -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard current == session.generation else { return false }
+        commit()
+        return true
+    }
+
+    /// Pays an abandoned attempt's cleanup debt, but only while the lease is
+    /// idle and only once.
+    ///
+    /// A successor that has already begun owns whatever is in the system now,
+    /// so clearing there would tear down a tunnel that is coming up correctly.
+    /// Timeout, stop and a late completion may arrive in any order; whichever
+    /// finds the lease idle pays, and the rest are refused.
+    ///
+    /// - Returns: whether `compensate` ran.
+    @discardableResult
+    func compensateIfIdle(_ compensate: () -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard current == nil, owesCompensation else { return false }
+        owesCompensation = false
+        compensate()
+        return true
+    }
+}
+
 
 
 struct PhysicalPathSnapshot: Equatable, Sendable {
