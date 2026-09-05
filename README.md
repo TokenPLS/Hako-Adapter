@@ -19,6 +19,16 @@ Both files import only system frameworks (`Foundation`, `Network`,
 kernel — the bridge speaks plain file descriptors — so the library also
 works with any core that can read/write a utun-framed descriptor.
 
+## 官网与客户端
+
+- [官方网站](https://clash.md/)
+- [在 App Store 下载官方客户端](https://apps.apple.com/app/id6794257189)
+
+## Official website and client
+
+- [Official website](https://clash.md/)
+- [Download the official client on the App Store](https://apps.apple.com/app/id6794257189)
+
 ## Requirements
 
 - iOS 15+ / macOS 13+ / tvOS 17+, Swift 5.9+
