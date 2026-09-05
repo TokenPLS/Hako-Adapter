@@ -239,6 +239,237 @@ final class ProviderTunnelSessionLease: @unchecked Sendable {
     }
 }
 
+/// Tracks synchronous and asynchronous configuration reloads. Async callers
+/// receive a process-scoped ticket and poll retained outcomes without waiting
+/// for the configuration apply operation. Synchronous replies remain inline.
+final class ProviderReloadEnvelope: @unchecked Sendable {
+    /// What `reloadStatus` says. `ticket` is 0 and `state` is `idle` until the
+    /// first asynchronous reload of the session; `error` is present only for
+    /// `failed`, and is Core's sentence verbatim (the App branches on its
+    /// tail); `unknown` answers a ticket this ledger has nothing true to say
+    /// about — never issued (the App is asking about a reload it sent to an
+    /// extension process that has since been replaced) or older than the last
+    /// few kept — so a stranger's outcome is never read as its own.
+    struct Status: Equatable {
+        enum State: String, Equatable {
+            case idle
+            case applying
+            case ok
+            case failed
+            case unknown
+        }
+
+        let session: String
+        let ticket: Int
+        let state: State
+        let error: String?
+
+        var jsonObject: [String: Any] {
+            var object: [String: Any] = ["session": session, "ticket": ticket, "state": state.rawValue]
+            if let error { object["error"] = error }
+            return object
+        }
+    }
+
+    /// The answer to a `reload` request: the JSON object to send back, and —
+    /// for an accepted asynchronous reload — the `start` that enters Core on
+    /// a task of its own. The caller invokes `start` once, after the reply has
+    /// been handed to the framework, so the acknowledgement has left before
+    /// Core begins to build anything; for the synchronous form and for
+    /// refusals there is nothing to start. Calling `start` again does nothing
+    /// (two applies of one text would race on Core's mutex and the later
+    /// would overwrite the ticket's outcome), and dropping it without ever
+    /// calling it abandons the ticket as failed rather than leaving it
+    /// applying for the life of the process with every later asynchronous
+    /// reload refused behind it.
+    struct Reply {
+        let object: [String: Any]
+        let start: (() -> Void)?
+    }
+
+    /// The gate behind `Reply.start`: enters Core once, and abandons the
+    /// ticket if it is released unentered.
+    private final class Start {
+        private let lock = NSLock()
+        private var started = false
+        private let envelope: ProviderReloadEnvelope
+        private let ticket: Int
+        private let apply: () throws -> Void
+
+        init(envelope: ProviderReloadEnvelope, ticket: Int, apply: @escaping () throws -> Void) {
+            self.envelope = envelope
+            self.ticket = ticket
+            self.apply = apply
+        }
+
+        func run() {
+            lock.lock()
+            guard !started else {
+                lock.unlock()
+                return
+            }
+            started = true
+            lock.unlock()
+            let envelope = self.envelope
+            let ticket = self.ticket
+            let apply = self.apply
+            Task.detached(priority: .userInitiated) {
+                envelope.finish(ticket, envelope.run(apply))
+            }
+        }
+
+        deinit {
+            lock.lock()
+            let unstarted = !started
+            lock.unlock()
+            if unstarted {
+                envelope.finish(ticket, Outcome(error: "hako: reload was accepted but never started"))
+            }
+        }
+    }
+
+    static let capability = "reload-async-v1"
+
+    private let lock = NSLock()
+    /// Names this ledger for the App: one value per instance, hence per
+    /// extension process (the provider holds one for its lifetime).
+    private let session = UUID().uuidString
+    private var nextTicket = 0
+    private var inFlight: Set<Int> = []
+    /// Synchronous reloads holding Core right now. Not ticketed — answered
+    /// in their own reply — but Core is busy for as long as they run, which
+    /// is what an asynchronous request has to be told.
+    private var synchronousRunning = 0
+    /// Outcomes by ticket, kept for the last few reloads, so a reload
+    /// finishing later cannot overwrite an earlier ticket's answer. Bounded,
+    /// because the App only ever asks about the reload it just sent.
+    private var outcomes: [Int: Status] = [:]
+    private static let outcomesKept = 16
+
+    /// Answers a `reload` request. `apply` is the call into Core, handed in so
+    /// the envelope's promises can be tested without one; it is invoked at
+    /// most once — inline for the synchronous form, and for the asynchronous
+    /// form only when the returned `start` is invoked, on a detached task.
+    func reply(
+        to request: [String: Any],
+        apply: @escaping () throws -> Void
+    ) -> Reply {
+        let asynchronous = Self.isJSONTrue(request["async"])
+        lock.lock()
+        guard asynchronous else {
+            synchronousRunning += 1
+            lock.unlock()
+            let outcome = run(apply)
+            lock.lock()
+            synchronousRunning -= 1
+            lock.unlock()
+            if let error = outcome.error {
+                return Reply(object: ["error": error], start: nil)
+            }
+            return Reply(object: ["ok": true], start: nil)
+        }
+        if !inFlight.isEmpty || synchronousRunning > 0 {
+            var refusal: [String: Any] = ["error": "reload in progress"]
+            if let running = inFlight.max() {
+                refusal["ticket"] = running
+            }
+            lock.unlock()
+            return Reply(object: refusal, start: nil)
+        }
+        nextTicket += 1
+        let ticket = nextTicket
+        inFlight.insert(ticket)
+        lock.unlock()
+        let start = Start(envelope: self, ticket: ticket, apply: apply)
+        return Reply(
+            object: ["accepted": true, "ticket": ticket, "session": session],
+            start: { start.run() }
+        )
+    }
+
+    /// Answers a `reloadStatus` request at the wire: `ticket` absent means the
+    /// newest reload; a whole number means that reload; anything else is a
+    /// malformed question and gets an error, not a plausible answer to a
+    /// different question. Reads this object only; never enters Core.
+    func statusReply(to request: [String: Any]) -> [String: Any] {
+        guard let field = request["ticket"] else {
+            return status().jsonObject
+        }
+        guard let number = field as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let ticket = Int(exactly: number)
+        else {
+            return ["error": "bad ticket"]
+        }
+        return status(ticket: ticket).jsonObject
+    }
+
+    /// The opt-in is the JSON boolean `true` and nothing else. Foundation
+    /// bridges the number 1 to `Bool` true, and a caller that wrote
+    /// `"async": 1` by mistake would read an acknowledgement as a final
+    /// result; the boolean is told apart from a number by its CF type, which
+    /// is what JSONSerialization produces for `true`.
+    private static func isJSONTrue(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return false
+        }
+        return number.boolValue
+    }
+
+    /// Answers `reloadStatus`. Reads this object only; never enters Core.
+    ///
+    /// Without a ticket the answer is about the newest asynchronous reload of
+    /// the session; with one, about that reload — which is what an App that
+    /// holds a ticket should ask, so that another reload finishing in between
+    /// cannot be mistaken for its own.
+    func status(ticket requested: Int? = nil) -> Status {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let ticket = requested else {
+            if nextTicket == 0 {
+                return Status(session: session, ticket: 0, state: .idle, error: nil)
+            }
+            return statusLocked(of: nextTicket)
+        }
+        return statusLocked(of: ticket)
+    }
+
+    /// Tickets are issued from 1, so 0 and below were never issued.
+    private func statusLocked(of ticket: Int) -> Status {
+        if ticket >= 1, inFlight.contains(ticket) {
+            return Status(session: session, ticket: ticket, state: .applying, error: nil)
+        }
+        return outcomes[ticket] ?? Status(session: session, ticket: ticket, state: .unknown, error: nil)
+    }
+
+    private struct Outcome {
+        let error: String?
+    }
+
+    private func run(_ apply: () throws -> Void) -> Outcome {
+        do {
+            try apply()
+            return Outcome(error: nil)
+        } catch {
+            return Outcome(error: error.localizedDescription)
+        }
+    }
+
+    private func finish(_ ticket: Int, _ outcome: Outcome) {
+        lock.lock()
+        inFlight.remove(ticket)
+        outcomes[ticket] = Status(
+            session: session,
+            ticket: ticket,
+            state: outcome.error == nil ? .ok : .failed,
+            error: outcome.error
+        )
+        while outcomes.count > Self.outcomesKept, let oldest = outcomes.keys.min() {
+            outcomes.removeValue(forKey: oldest)
+        }
+        lock.unlock()
+    }
+}
 
 
 struct PhysicalPathSnapshot: Equatable, Sendable {
