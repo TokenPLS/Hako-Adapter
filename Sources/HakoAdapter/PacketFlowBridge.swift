@@ -470,11 +470,14 @@ final class PacketFlowBridge: @unchecked Sendable {
     private func scheduleFlowRead() {
         guard running, !flowReadOutstanding else { return }
         flowReadOutstanding = true
+        let generation = coreDrainGeneration
         packetFlow.readPackets { [weak self] packets, protocols in
             guard let self else { return }
             self.queue.async {
+                // Restart can happen before this queued completion runs. An
+                // old read must not clear the new read's outstanding flag.
+                guard self.running, self.coreDrainGeneration == generation else { return }
                 self.flowReadOutstanding = false
-                guard self.running else { return }
                 self.readCallbackBatches &+= 1
                 self.packetsFromSystem &+= UInt64(packets.count)
                 for packet in packets {
