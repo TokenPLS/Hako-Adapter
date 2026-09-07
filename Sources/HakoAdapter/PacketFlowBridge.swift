@@ -193,6 +193,9 @@ final class PacketFlowBridge: @unchecked Sendable {
     // the caller's side can clobber the thread-local errno before classification.
     private let sendToFlow: @Sendable (Int32, UnsafeRawPointer?, Int, Int32) -> (Int, Int32)
     private let recvFromFlow: @Sendable (Int32, UnsafeMutableRawPointer?, Int, Int32) -> (Int, Int32)
+    // The scheduler must enqueue the retry on the supplied serial queue. Keeping
+    // it injectable lets tests hold a pressure window without wall-clock races.
+    private let scheduleFlushRetry: @Sendable (DispatchQueue, UInt64, @escaping @Sendable () -> Void) -> Void
     private let configuration: PacketFlowBridgeConfiguration
     private let onFailure: (Error) -> Void
     private let log = Logger(subsystem: "app.hako.adapter", category: "packetflow")
@@ -277,6 +280,9 @@ final class PacketFlowBridge: @unchecked Sendable {
             let result = Darwin.recv(fd, buffer, length, flags)
             return (result, result < 0 ? errno : 0)
         },
+        scheduleFlushRetry: @escaping @Sendable (DispatchQueue, UInt64, @escaping @Sendable () -> Void) -> Void = { queue, delay, retry in
+            queue.asyncAfter(deadline: .now() + .nanoseconds(Int(delay)), execute: retry)
+        },
         onFailure: @escaping (Error) -> Void
     ) {
         self.packetFlow = packetFlow
@@ -286,6 +292,7 @@ final class PacketFlowBridge: @unchecked Sendable {
         self.monotonicNanoseconds = monotonicNanoseconds
         self.sendToFlow = sendToFlow
         self.recvFromFlow = recvFromFlow
+        self.scheduleFlushRetry = scheduleFlushRetry
         self.onFailure = onFailure
         queue.setSpecific(key: queueKey, value: 1)
     }
@@ -499,7 +506,9 @@ final class PacketFlowBridge: @unchecked Sendable {
     }
 
     private func flushPendingToCore() {
-        guard running else { return }
+        // New PacketFlow batches and already-queued write events must respect
+        // the same pressure window. Only the scheduled retry clears this flag.
+        guard running, !flushBackoffScheduled else { return }
         while pendingHead < pendingToCore.count {
             let pending = pendingToCore[pendingHead]
             let (sent, sendErrno) = pending.frame.withUnsafeBytes { bytes in
@@ -745,7 +754,7 @@ final class PacketFlowBridge: @unchecked Sendable {
         let delay = resourceBackoffNanoseconds(consecutiveFlushPressure)
         sendBackoffCount &+= 1
         sendAccumulatedBackoffNanoseconds &+= delay
-        queue.asyncAfter(deadline: .now() + .nanoseconds(Int(delay))) { [weak self] in
+        scheduleFlushRetry(queue, delay) { [weak self] in
             guard let self, self.running, self.coreDrainGeneration == generation else { return }
             self.flushBackoffScheduled = false
             self.flushPendingToCore()
